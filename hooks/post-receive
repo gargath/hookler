@@ -1,0 +1,161 @@
+#!/usr/bin/env ruby
+#post receive
+
+require 'fileutils'
+require 'pathname'
+require 'yaml'
+require 'rake'
+require_relative 'slacker.rb'
+
+include Slacker
+
+at_exit do
+  if (! $!.nil?) && ($!.class != SystemExit)
+    send_fail("-", "post-receive", "Unexpected error in hook: #{$!.class} - #{$!}")
+  end
+end
+
+unless File.exists?('hooks/config.yaml')
+ puts "[FATAL] Config file not found."
+ exit 255
+end
+config = YAML.load_file('hooks/config.yaml')
+
+@DEPLOY_DIR = config['deploy_dir']
+@STAGING_DIR = config['staging_dir']
+
+@old, @new, ref = ARGF.read.split " "
+
+ref_type = `git cat-file -t #{ref}`
+if ref_type.include? "commit"
+  puts "[CHECK] Un-annotated tags are not eligible for deployment. Please tag with git tag [-a | -s]."
+  puts "[CHECK] FAIL: Nothing to deploy for this push."
+  send_fail(ref, "post-receive", "Un-annotated tag pushed")
+  exit 1
+end
+
+tagname = ref.split('/')[-1]
+if tagname.start_with? "staging"
+  puts "[CHECK] Staging release."
+  @TO_DIR = @STAGING_DIR
+elsif tagname.start_with? "release"
+  puts "[CHECK] Production release."
+  @TO_DIR = @DEPLOY_DIR
+else
+  puts "[CHECK] FAIL: Invalid tag name. Nothing to deploy."
+  send_fail(ref, "post-receive", "Invalid tag name. (Why did we not catch this in pre-receive?)")
+  exit 1
+end
+
+rev = @new =~ /^0*$/ ? @old : @new
+
+gitout = `git remote show origin 2>&1`
+origin_name = gitout[/#{"Fetch URL: "}(.*?)#{"\n"}/m, 1].split("/")[-1]
+@tmpdir = "/tmp/git/#{origin_name}/#{rev}"
+FileUtils::mkdir_p(@tmpdir)
+puts "[PREPARE] Checking out your ref from origin #{origin_name} to #{@tmpdir}"
+
+`GIT_WORK_TREE="#{@tmpdir}" git checkout -f -q #{rev}`
+git_status = $?
+if git_status.exitstatus != 0
+  puts "[PREPARE] FAIL: Failed to check out code. Please make sure to push changes to origin before deploying."
+  send_fail(ref, "post_receive", "Failed to check out pushed revision")
+  exit git_status.exitstatus
+end
+puts "[PREPARE] Successfully checked out #{@rev}"
+
+if (@new =~ /^0*$/)
+  puts "[ROLLBACK] Trying to roll back"
+  if !File.exists?("#{@TO_DIR}/latest")
+    puts "[ROLLBACK] FAIL: No current release. Unable to auto-rollback. Please cleanup deploy directory manually."
+    send_fail(ref, "post-receive", "ROLLBACK not possible. No current release")
+    exit 1
+  end
+  if !File.exists?("#{@TO_DIR}/previous")
+    puts "[ROLLBACK] FAIL: Previous release does not exist. Unable to auto-rollback. Please clean up deploy directory manually."
+    send_fail(ref, "post-receive", "ROLLBACK not possible. No previous release")  
+    exit 1
+  end
+
+  current_release = Pathname.new("#{@TO_DIR}/latest").realpath
+  previous_release = Pathname.new("#{@TO_DIR}/previous").realpath
+  puts "[ROLLBACK] Executing app-specific rollback"
+
+  Dir.chdir(@tmpdir)
+  rake = Rake.application
+  rake.init
+  begin
+    rake.load_rakefile
+  rescue Exception => e
+    puts "[ROLLBACK] FAIL: Failed to load application's rakefile"
+    send_fail(ref, "post-receive", "Failed to load rakefile during ROLLBACK: #{e}")
+  end
+  begin
+    rake['rollback'].invoke(@TO_DIR, rev)
+  rescue RuntimeError => e
+    puts "[ROLLBACK] FAIL: Rake exited with error: #{e}."
+    puts "Please perform app-specific rollback operations manually"
+    send_fail(ref, "post-receive", "Rakefile failed during ROLLBACK: #{e}")
+  end
+
+  puts "App-specific tasks done. Cleaning up..."
+  FileUtils::rm_rf("#{@TO_DIR}/latest")
+  FileUtils::ln_s(previous_release, "#{@TO_DIR}/latest", :force => true)
+  releases = Dir.glob("#{@TO_DIR}/*")
+  releases.delete(previous_release)
+  new_previous = releases.max_by { |f| f.partition("/").last.length==40 ? File.ctime(f) : Time.new(0) }
+  FileUtils::rm_rf("#{@TO_DIR}/latest")
+  FileUtils::ln_s(new_previous, "#{@TO_DIR}/previous", :force => true)
+
+  puts "Rollback complete. /latest is now #{previous_release.to_s.split('/')[-1]}, /previous is #{new_previous.to_s.split('/')[-1]}."
+  send_rollback(ref)
+  exit 0
+
+else
+
+  Dir.chdir(@tmpdir)
+  tagname = ref.split('/')[-1]
+  if tagname.start_with? "staging"
+    puts "[DEPLOY] Deploying to staging."
+    @TO_DIR = @STAGING_DIR
+  elsif tagname.start_with? "release"
+    puts "[DEPLOY] Deploying to production."
+    @TO_DIR = @DEPLOY_DIR
+  else
+    puts "[DEPLOY] Invalid tag name. Nothing to deploy."
+    send_fail(ref, "post-receive", "Invalid tag name. (Why did we not catch this in pre-receive?)")
+    exit 1
+  end
+
+  puts "[DEPLOY] Will deploy to #{@TO_DIR}"
+
+  puts "[DEPLOY] Executing app-specific deployment"
+  rake = Rake.application
+  rake.init
+  begin
+    rake.load_rakefile
+  rescue Exception => e
+    puts "[DEPLOY] FAIL: Failed to load application's rakefile"
+    send_fail(ref, "post-receive", "Failed to load rakefile.")
+  end
+  begin
+    rake['deploy'].invoke(@tmpdir, @TO_DIR, rev)
+  rescue RuntimeError => e
+    puts "[DEPLOY] FAIL: Rake exited with error: #{e}."
+    puts "Please perform app-specific rollback operations manually"
+    send_fail(ref, "post-receive", "Failed to execute rakefile during deploy")
+  end
+  puts "[DEPLOY] Application specific deployment tasks done"
+
+  if File.exists?("#{@TO_DIR}/latest")
+    previous = Pathname.new("#{@TO_DIR}/latest").realpath
+    FileUtils::rm_rf("#{@TO_DIR}/previous")
+    FileUtils::ln_s(previous, "#{@TO_DIR}/previous", :force => true)
+  end
+  FileUtils::rm_rf("#{@TO_DIR}/latest")
+  FileUtils::ln_s("#{@TO_DIR}/#{@new}", "#{@TO_DIR}/latest", :force => true)
+  FileUtils::rm_rf(@tmpdir)
+
+  send_complete(tagname)
+
+end

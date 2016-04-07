@@ -1,0 +1,21 @@
+require 'pathname'
+require 'fileutils'
+
+task default: [:deploy]
+
+task :deploy, [:source_dir, :target_dir, :release_folder]  do |t, args|
+  src = args[:source_dir]
+  dst = args[:target_dir]
+  fld = args[:release_folder]
+  FileUtils::rm_rf("#{src}/include")
+  FileUtils::mkdir_p(dst)
+  FileUtils::cp_r(src,dst)
+  FileUtils::rm_rf("#{dst}/#{fld}/.git")
+  FileUtils::rm_rf("#{dst}/#{@fld}/README.md")
+  FileUtils::rm_rf("#{dst}/#{@fld}/rakefile")
+  FileUtils::ln_s("#{dst}/include", "#{dst}/#{fld}/include", :force => true)
+end
+
+task :rollback, [:target_dir, :release_folder] do |t, args|
+ FileUtils::rm_rf("#{args[:target_dir]}/#{args[:release_folder]}")
+end

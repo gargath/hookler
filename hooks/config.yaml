@@ -1,0 +1,3 @@
+deploy_dir: /Library/WebServer/Documents/deploytest
+staging_dir: /Library/WebServer/Documents/staging/deploytest
+webhook: https://hooks.slack.com/services/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
